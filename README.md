@@ -41,9 +41,10 @@ docker build -t law-links-service .
 ```
 
 ### 2. Запуск контейнера
+⚠️  ВНИМАНИЕ: Сервис запускается долго ~15 минут (Просьба дождаться)
 
 ```bash
-docker run -d -p 8978:8978 --name law-links law-links-service
+docker run -p 8978:8978 --name law-links law-links-service
 ```
 
 ### 3. Проверка состояния сервиса

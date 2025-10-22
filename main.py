@@ -17,6 +17,8 @@ from pydantic import BaseModel
 # Настройки и логирование
 # =======================
 
+KW_SUBP = r"(?:подпункт\w*|подпп\.|подп\.|пп\.)"
+
 # Включить/выключить авто-самотесты при старте сервера
 RUN_STARTUP_SELFTESTS = True
 
@@ -113,13 +115,14 @@ L2C_MAP = str.maketrans({
 def normalize_for_alias(s: str) -> str:
     """Нормализация строк именно для сопоставления названий законов."""
     s = normalize_text(s)
-    s = s.translate(L2C_MAP)  # NB: только здесь, не глобально!
+    s = s.translate(L2C_MAP) 
     s = s.strip().lower()
     s = re.sub(r"\s+", " ", s)
     return s
 
 def norm_alias_key(s: str) -> str:
     return normalize_for_alias(s)
+
 
 def build_alias_maps(codex_aliases: Dict[str, List[str]]):
     """
@@ -137,18 +140,39 @@ def build_alias_maps(codex_aliases: Dict[str, List[str]]):
         "А":"A","В":"B","Е":"E","К":"K","М":"M","Н":"H","О":"O","Р":"P","С":"C","Т":"T","Х":"X","У":"Y",
         "а":"a","в":"b","е":"e","к":"k","м":"m","н":"h","о":"o","р":"p","с":"c","т":"t","х":"x","у":"y",
     }
+
     def flex_char(ch: str) -> str:
         return f"[{re.escape(ch)}{LOOKALIKE[ch]}]" if ch in LOOKALIKE else re.escape(ch)
 
+    UPPER_RU = r"[А-ЯЁ]"
+    LOWER_RU = r"[а-яё]"
+    RU_WORD   = r"[А-Яа-яЁё]+"
+
+    def is_all_caps_short(tok: str) -> bool:
+        # Аббревиатуры наподобие "НК", "УК", "ГПК", "КоАП" (последнее не all-caps, но короткое)
+        return bool(re.fullmatch(rf"{UPPER_RU}{{2,5}}", tok))
+
     def flex_word(tok: str) -> str:
+        """
+        Гибкое слово:
+          - 'РФ' обрабатываем посимвольно с LOOKALIKE
+          - Короткие аббревиатуры (ГПК, НК...) без хвоста '[а-яё]*'
+          - Для обычных слов — допускаем морф. окончания через '[а-яё]*'
+          - Прилагательные на -ый/-ий/-ой 
+        """
         if tok.upper() == "РФ":
             return "".join(flex_char(c) for c in tok)
+
+        if is_all_caps_short(tok):
+            return "".join(flex_char(c) for c in tok)
+
         if re.search(r"(ый|ий|ой)$", tok, flags=re.IGNORECASE):
             stem = tok[:-2]
             stem = "".join(flex_char(c) for c in stem)
-            return fr"{stem}[а-яё]+"
+            return fr"{stem}{LOWER_RU}+"
+
         stem = "".join(flex_char(c) for c in tok)
-        return fr"{stem}[а-яё]*"
+        return fr"{stem}{LOWER_RU}*"
 
     def alias_to_pattern(alias: str) -> str:
         alias = normalize_text(alias)
@@ -157,11 +181,13 @@ def build_alias_maps(codex_aliases: Dict[str, List[str]]):
         for t in tokens:
             if t.isspace():
                 out.append(r"\s+")
-            elif re.fullmatch(r"[А-Яа-яЁё]+", t) and len(t) >= 2:
+            elif re.fullmatch(RU_WORD, t) and len(t) >= 2:
                 out.append(flex_word(t))
             else:
                 out.append(re.escape(t))
-        return "".join(out)
+        core = "".join(out)
+        # Жёсткие границы слова вокруг ВЕСЬ алиаса, чтоб не матчить внутри слов
+        return rf"(?<![0-9A-Za-zА-Яа-яЁё])(?:{core})(?![0-9A-Za-zА-Яа-яЁё])"
 
     # длинные алиасы — первыми
     all_items = []
@@ -182,10 +208,8 @@ def build_alias_maps(codex_aliases: Dict[str, List[str]]):
         parts.append(fr"(?P<{gname}>" + "|".join(patts) + ")")
 
     LAW_NAMED = "(?:" + "|".join(parts) + ")"
-    # non-capturing вариант для lookahead'ов — просто убираем имена групп
     LAW_NONCAP = re.sub(r"\(\?P<LID_\d+>", "(?:", LAW_NAMED)
     return alias_to_id, LAW_NAMED, LAW_NONCAP, lid_group_names
-
 
 
 
@@ -284,30 +308,38 @@ def _expand_numeric_range(a: str, b: str) -> List[str]:
     # Иначе оставляем как есть (без расширения)
     return [a, b]
 
+
+
 def _split_by_commas_and_conj(s: str) -> List[str]:
+    """
+    Режем перечисление по , ; и союзам 'и/или', 'или', 'либо', 'и'.
+    ВАЖНО: если chunk — это ОДНА буква (например, 'и'), считаем это значением,
+    а не союзом.
+    """
     s = s.strip()
     if not s:
         return []
-    # привести союзы к запятым
-    s = re.sub(r"\bи\/или\b", ",", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bили\b", ",", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bлибо\b", ",", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bи\b", ",", s, flags=re.IGNORECASE)
-    # точка с запятой тоже как разделитель
-    s = s.replace(";", ",")
-    # разбиваем по запятым
-    parts = [p.strip() for p in s.split(",") if p.strip()]
-    return parts
+    # одиночная буква — это значение, не союз
+    if re.fullmatch(r"[A-Za-zА-Яа-яё]", s):
+        return [s]
+    # обычный случай — режем по разделителям/союзам
+    parts = re.split(r"\s*(?:,|;|и\/или|либо|или|и)\s*", s, flags=re.IGNORECASE)
+    return [p for p in parts if p]
 
 
-def parse_values(chunk: Optional[str]) -> List[str]:
-    """Разворачивает "1, 2 и 3", "43.2-6", "а-в" в список отдельных элементов."""
+def parse_values(chunk: Optional[str], *, expand_hyphens: bool = True) -> List[str]:
+    """
+    Разворачивает '1, 2 и 3', 'а-в', '43.2-6' в список значений.
+    Если expand_hyphens=False (для статей), НЕ разворачиваем диапазон, оставляем
+    строку как есть ('51.8-7').
+    """
     if not chunk:
         return []
     parts = _split_by_commas_and_conj(chunk)
     out: List[str] = []
     for p in parts:
-        if "-" in p:
+        p = p.strip()
+        if "-" in p and expand_hyphens:
             a, b = [q.strip() for q in p.split("-", 1)]
             if _is_letter(a) and _is_letter(b):
                 out.extend(_expand_letter_range(a, b))
@@ -315,6 +347,7 @@ def parse_values(chunk: Optional[str]) -> List[str]:
                 out.extend(_expand_numeric_range(a, b))
         else:
             out.append(p)
+
     # Убираем дубли, сохраняя порядок
     seen = set()
     uniq = []
@@ -324,15 +357,14 @@ def parse_values(chunk: Optional[str]) -> List[str]:
             uniq.append(v)
     return uniq
 
-
 # ===========================
 # Компиляция общих шаблонов
 # ===========================
 
 # Ключевые слова (учитываем падежи + защищаем короткие аббревиатуры от вхождений внутрь слов)
 KW_ART  = r"(?:ст(?:атья|атьи|атье|атью|\.?)\w*)"
-KW_PNT  = r"(?:пункт\w*|(?<![А-Яа-яё])п\.)"   # <-- раньше было (?:пункт\w*|п\.)
-KW_PART = r"(?:част\w*|(?<![А-Яа-яё])ч\.)"    # <-- раньше было (?:част\w*|ч\.)
+KW_PNT  = r"(?:пункт\w*|(?<![А-Яа-яё])п\.)"
+KW_PART = r"(?:част\w*|(?<![А-Яа-яё])ч\.)"  
 KW_SUBP = r"(?:подпункт\w*|подп\.|пп\.)"
 
 def compile_patterns(LAW_NAMED: str, LAW_NONCAP: str) -> Dict[str, re.Pattern]:
@@ -351,7 +383,7 @@ def compile_patterns(LAW_NAMED: str, LAW_NONCAP: str) -> Dict[str, re.Pattern]:
         fr"(?:{TOK_SUBP}\s*(?P<subp_vals>{VAL_CHUNK}?){LA_AFTER_SUBP}\s*[;,]?\s*)?"
         fr"(?:{TOK_PNPART}\s*(?P<point_vals>{VAL_CHUNK}?){LA_AFTER_POINT}\s*[;,]?\s*)?"
         fr"{TOK_ART}\s*(?P<article_vals>{VAL_CHUNK}?){LA_AFTER_ART}\s*"
-        fr"(?P<law>{LAW_NAMED})"   # ⬅️ а здесь — именованные LID_*
+        fr"(?P<law>{LAW_NAMED})"  
         fr")",
         flags=re.IGNORECASE
     )
@@ -441,56 +473,47 @@ def _is_numeric_point(value: Optional[str]) -> bool:
 def detect_links(
     text: str,
     codex_aliases: Dict[str, List[str]],
-    *,
-    smart_point_fix: bool = False,   # True -> переносим одиночную букву из пункта в подпункт
 ) -> List["ParsedRef"]:
     """
-    Главная функция извлечения ссылок.
-    Добавлена послепарсерная фильтрация:
-      - point_article должен быть числом (или None). Буквы в пункте отбрасываются,
-        либо (если smart_point_fix=True) перекладываются в subpoint_article.
-    """
-    text_norm = normalize_text(text)
+    Извлекает юридические ссылки из текста.
 
-    # Построение алиасов закона и паттернов
-    alias_map, LAW_NAMED, LAW_NONCAP, lid_group_names = build_alias_maps(codex_aliases)
+    Ключевые решения:
+      - Статьи НЕ разворачиваем по дефисам (например, '51.8-7' остаётся как есть),
+        чтобы совпадать с эталонными тестами.
+      - Пункты и подпункты разворачиваем (диапазоны/перечисления поддерживаются).
+      - Буквенные пункты допустимы (например, 'п. с').
+    """
+    # 1) Нормализация и подготовка шаблонов
+    text_norm = normalize_text(text)
+    _, LAW_NAMED, LAW_NONCAP, lid_group_names = build_alias_maps(codex_aliases)
     pats = compile_patterns(LAW_NAMED, LAW_NONCAP)
 
-    # Сбор всех совпадений из трёх порядков
-    matches = []
+    # 2) Собираем все совпадения из разных «порядков»
+    matches: List[Tuple[int, int, re.Match]] = []
     for patt in pats.values():
         for m in patt.finditer(text_norm):
             matches.append((m.start(), m.end(), m))
     matches.sort(key=lambda t: (t[0], t[1]))
 
+    # 3) Преобразуем совпадения в сырые элементы
     raw_items: List[Dict] = []
     for st, en, m in matches:
-        # Извлекаем law_id напрямую из именованных групп LID_*
         law_id = extract_law_id_from_match(m, lid_group_names)
         if law_id is None:
-            # если не получилось — пропускаем матч
             continue
 
         gd = m.groupdict()
-        art_vals = parse_values(gd.get("article_vals"))
-        pnt_vals = parse_values(gd.get("point_vals"))
-        sub_vals = parse_values(gd.get("subp_vals"))
+        # ВАЖНО: статьи НЕ разворачиваем (expand_hyphens=False),
+        # пункты/подпункты — разворачиваем.
+        art_vals = parse_values(gd.get("article_vals"), expand_hyphens=False)
+        pnt_vals = parse_values(gd.get("point_vals"),   expand_hyphens=True)
+        sub_vals = parse_values(gd.get("subp_vals"),    expand_hyphens=True)
 
         arts = art_vals or [None]
         pnts = pnt_vals or [None]
         subs = sub_vals or [None]
 
         for a, p, s in product(arts, pnts, subs):
-            # ---- ПОСЛЕПАРСЕРНАЯ ФИЛЬТРАЦИЯ ДЛЯ point_article ----
-            if p is not None and not _is_numeric_point(p):
-                if smart_point_fix and s is None and _SINGLE_LETTER_RE.fullmatch(p):
-                    # «умная починка»: переносим одиночную букву из пункта в подпункт
-                    s = p
-                    p = None
-                else:
-                    # строгий режим: буква в пункте недопустима -> отбрасываем комбинацию
-                    continue
-
             raw_items.append({
                 "law_id": law_id,
                 "article": a,
@@ -499,10 +522,10 @@ def detect_links(
                 "span": (st, en),
             })
 
-    # Удаляем менее специфичные записи (например, без подпункта рядом с теми же (law, art, point) с подпунктом)
+    # 4) Удаляем менее специфичные записи (без подпункта рядом с теми же law/art/point)
     raw_items = prune_less_specific(raw_items)
 
-    # Дедупликация и сбор ParsedRef
+    # 5) Дедупликация с сохранением порядка
     seen = set()
     result: List[ParsedRef] = []
     for it in raw_items:
@@ -518,8 +541,6 @@ def detect_links(
         ))
 
     return result
-
-
 
 
 # ============================
@@ -623,8 +644,7 @@ def _run_self_tests(codex_aliases: Dict[str, List[str]]) -> None:
         ("ч. 3, ст. 30.1 КоАП РФ", {"expect_count": 1,
                                     "expect_article": "30.1"}),
         # Диапазон в статье с укороченной правой границей
-        ("ст. 43.2-6 НК РФ", {"expect_count": 5,
-                              "expect_articles": {"43.2","43.3","43.4","43.5","43.6"}}),
+        ("ст. 43.2-6 НК РФ", {"expect_count": 1,"expect_article": "43.2-6"}),
         # Подпункты с буквами и перечислением пунктов
         ("в подпунктах а, б и в пункта 3.345, 23 в статье 66 НК РФ",
          {"expect_min_count": 3, "expect_article": "66"}),
